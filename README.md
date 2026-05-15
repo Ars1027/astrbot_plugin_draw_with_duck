@@ -1,0 +1,1 @@
+# astrbot_plugin_draw_with_duck
