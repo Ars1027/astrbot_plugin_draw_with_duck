@@ -1,7 +1,7 @@
 name: astrbot_plugin_draw_with_duck
 display_name: 鸭子图画图
-desc: 使用已配置模型将提示词增强为 Danbooru tag，调用 RunningHub 生成鸭子图，并按配置返回原图或鸭子图。
-version: v1.0.5
+desc: 按 SKILL.md 规则增强并翻译提示词，调用 RunningHub 生成鸭子图，并按配置返回原图或鸭子图。
+version: v1.0.9
 author: Luochang
 repo: ""
 support_platforms:

@@ -1,6 +1,5 @@
 import asyncio
 import json
-import random
 import re
 import time
 import traceback
@@ -23,6 +22,14 @@ DEFAULT_POSITIVE_TEMPLATE = (
 )
 DUCK_DECODER_URL = "https://duck.airush.top/"
 VALID_OUTPUT_IMAGE_MODES = {"decoded", "duck"}
+VALID_PROMPT_DELIVERY_MODES = {"workflow_input", "final_clip"}
+FALLBACK_PROMPT_SKILL = (
+    "You are an ANIMA3 prompt engineer for anime text-to-image generation. "
+    "Translate and enhance the user's idea into one concise English positive prompt. "
+    "Use Danbooru-style tags first, ordered by subject count, character identity, appearance, "
+    "clothing/state, pose/action, expression, camera/shot, scene/environment, and detail/mood. "
+    "Return only one line of final prompt text. Do not output explanations, markdown, JSON, or self-check notes."
+)
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -38,8 +45,8 @@ def _as_bool(value: Any, default: bool = False) -> bool:
 @register(
     "astrbot_plugin_draw_with_duck",
     "Luochang",
-    "使用当前会话模型增强提示词，调用 RunningHub 生成鸭子图并用 SS_tools 解码后返回图片",
-    "v1.0.5",
+    "按 SKILL.md 规则增强并翻译提示词，调用 RunningHub 生成鸭子图并用 SS_tools 解码后返回图片",
+    "v1.0.9",
 )
 class DrawWithDuckPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -61,23 +68,30 @@ class DrawWithDuckPlugin(Star):
         self.prompt_field_name = str(config.get("prompt_field_name", "text") or "text").strip()
         self.negative_node_id = str(config.get("negative_node_id", "12") or "12").strip()
         self.negative_prompt = str(config.get("negative_prompt", "") or "").strip()
-        self.seed_node_id = str(config.get("seed_node_id", "19") or "19").strip()
-        self.width_node_id = str(config.get("width_node_id", "63") or "63").strip()
-        self.height_node_id = str(config.get("height_node_id", "64") or "64").strip()
         self.duck_password_node_id = str(config.get("duck_password_node_id", "99") or "99").strip()
         self.duck_password = str(config.get("duck_password", "") or "")
 
-        self.default_width = max(64, int(config.get("default_width", 1024) or 1024))
-        self.default_height = max(64, int(config.get("default_height", 1536) or 1536))
-        self.default_steps = int(config.get("default_steps", 30) or 30)
-        self.default_cfg = float(config.get("default_cfg", 5) or 5)
-        self.random_seed = _as_bool(config.get("random_seed", True), True)
-
         self.enhance_prompt = _as_bool(config.get("enhance_prompt", True), True)
+        self.prompt_danbooru_tag_format = _as_bool(
+            config.get("prompt_danbooru_tag_format", True), True
+        )
         self.prompt_provider_id = str(config.get("prompt_provider_id", "") or "").strip()
         self.prompt_template = str(
             config.get("prompt_template", DEFAULT_POSITIVE_TEMPLATE) or DEFAULT_POSITIVE_TEMPLATE
         )
+        self.prompt_delivery_mode = str(
+            config.get("prompt_delivery_mode", "workflow_input") or "workflow_input"
+        ).strip().lower()
+        if self.prompt_delivery_mode not in VALID_PROMPT_DELIVERY_MODES:
+            logger.warning(
+                f"invalid prompt_delivery_mode={self.prompt_delivery_mode}, fallback to workflow_input"
+            )
+            self.prompt_delivery_mode = "workflow_input"
+        if self.prompt_delivery_mode == "final_clip" and self.prompt_node_id == "93":
+            logger.warning(
+                "prompt_delivery_mode=final_clip usually needs prompt_node_id to point to the final "
+                "CLIPTextEncode text field, not the workflow LLM input node"
+            )
         self.show_enhanced_prompt = _as_bool(config.get("show_enhanced_prompt", False), False)
         self.output_image_mode = str(config.get("output_image_mode", "decoded") or "decoded").strip().lower()
         if self.output_image_mode not in VALID_OUTPUT_IMAGE_MODES:
@@ -92,6 +106,7 @@ class DrawWithDuckPlugin(Star):
 
         self.session: aiohttp.ClientSession | None = None
         self._tasks: set[asyncio.Task] = set()
+        self._prompt_skill_text: str | None = None
 
     async def initialize(self):
         self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=90))
@@ -144,13 +159,14 @@ class DrawWithDuckPlugin(Star):
             "raw_prompt": raw_prompt,
             "enhanced_prompt": enhanced_prompt,
             "final_prompt": final_prompt,
+            "prompt_delivery_mode": self.prompt_delivery_mode,
             "created_at": time.time(),
         }
         await self.put_kv_data(f"duck_task_{task_id}", json.dumps(task_info, ensure_ascii=False))
 
         msg = f"任务已提交：{task_id}"
         if self.show_enhanced_prompt:
-            msg += f"\n英文提示词：{enhanced_prompt}"
+            msg += f"\n最终正向提示词：{final_prompt}"
         yield event.plain_result(msg)
 
         task = asyncio.create_task(self._background_polling(task_id))
@@ -185,26 +201,18 @@ class DrawWithDuckPlugin(Star):
 
     async def _enhance_prompt(self, event: AstrMessageEvent, prompt: str) -> str:
         if not self.enhance_prompt:
-            return self._normalize_danbooru_tags(prompt) or prompt
+            return self._format_enhanced_prompt(prompt) or prompt
 
         provider_id = await self._get_prompt_provider_id(event.unified_msg_origin)
         if not provider_id:
             logger.warning("no available prompt provider, fallback to raw prompt")
-            return prompt
+            return self._format_enhanced_prompt(prompt) or prompt
 
-        system_prompt = (
-            "You are a Danbooru tag prompt engineer for anime text-to-image generation. "
-            "Translate and enhance the user's idea into Danbooru-style positive tags only. "
-            "Every tag must be English, lowercase, comma-separated, and use underscores instead of spaces, "
-            "for example: blue_hair, looking_at_viewer, night_sky. "
-            "Include tags for subject count, character type, composition, appearance, clothing, expression, "
-            "pose, background, lighting, mood, color palette, and quality/style. "
-            "Do not output natural language sentences, explanations, markdown, JSON, quotes, or negative prompt."
-        )
+        system_prompt = self._build_prompt_system_prompt()
         user_prompt = (
             "User idea:\n"
             f"{prompt}\n\n"
-            "Return only the final Danbooru-style tag list."
+            "Return only the final one-line prompt."
         )
 
         for attempt in range(2):
@@ -214,14 +222,53 @@ class DrawWithDuckPlugin(Star):
                     prompt=user_prompt,
                     system_prompt=system_prompt,
                 )
-                text = self._clean_llm_prompt(getattr(resp, "completion_text", "") or "")
+                text = self._format_enhanced_prompt(getattr(resp, "completion_text", "") or "")
                 if text:
                     return text
             except Exception as exc:
                 logger.warning(f"prompt enhancement failed ({attempt + 1}/2): {exc}")
                 await asyncio.sleep(1)
 
-        return self._normalize_danbooru_tags(prompt) or prompt
+        return self._format_enhanced_prompt(prompt) or prompt
+
+    def _build_prompt_system_prompt(self) -> str:
+        skill_text = self._load_prompt_skill()
+        format_rule = (
+            "After following the skill, force the final output into strict Danbooru-style tags: "
+            "lowercase English, comma-separated, underscores instead of spaces, no natural-language sentences."
+            if self.prompt_danbooru_tag_format
+            else "After following the skill, keep its output protocol: tags first, with a short English natural-language supplement at the end only when the skill says it is needed."
+        )
+        return (
+            f"{skill_text}\n\n"
+            "Runtime constraints for this plugin:\n"
+            "- Follow the skill above when translating and enhancing the user idea.\n"
+            "- Output only the final positive prompt as one plain-text line.\n"
+            "- Do not output explanations, markdown, code fences, JSON, headings, self-check notes, or negative prompt.\n"
+            f"- {format_rule}"
+        )
+
+    def _load_prompt_skill(self) -> str:
+        if self._prompt_skill_text is not None:
+            return self._prompt_skill_text
+
+        skill_path = Path(__file__).with_name("SKILL.md")
+        for encoding in ("utf-8", "utf-8-sig", "gbk"):
+            try:
+                self._prompt_skill_text = skill_path.read_text(encoding=encoding).strip()
+                if self._prompt_skill_text:
+                    return self._prompt_skill_text
+            except UnicodeDecodeError:
+                continue
+            except FileNotFoundError:
+                logger.warning(f"prompt skill file not found: {skill_path}")
+                break
+            except Exception as exc:
+                logger.warning(f"failed to read prompt skill file {skill_path}: {exc}")
+                break
+
+        self._prompt_skill_text = FALLBACK_PROMPT_SKILL
+        return self._prompt_skill_text
 
     async def _get_prompt_provider_id(self, umo: str) -> str | None:
         if self.prompt_provider_id:
@@ -253,11 +300,24 @@ class DrawWithDuckPlugin(Star):
         return None
 
     def _clean_llm_prompt(self, text: str) -> str:
+        return self._format_enhanced_prompt(text)
+
+    def _format_enhanced_prompt(self, text: str) -> str:
+        cleaned = self._clean_prompt_text(text)
+        if self.prompt_danbooru_tag_format:
+            return self._normalize_danbooru_tags(cleaned)
+        return cleaned
+
+    def _clean_prompt_text(self, text: str) -> str:
         text = text.strip()
         text = re.sub(r"^```(?:\w+)?", "", text).strip()
         text = re.sub(r"```$", "", text).strip()
         text = text.strip("\"'` \n\r\t")
-        return self._normalize_danbooru_tags(text)
+        text = re.sub(r"^\s*(?:[-*+•]|\d+[\.)]|[a-zA-Z][\.)])\s+", "", text, flags=re.MULTILINE)
+        text = re.sub(r"\b(?:positive\s*)?prompt\s*[:：]", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\b(?:tags?|danbooru\s*tags?)\s*[:：]", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"[\n\r]+", ", ", text)
+        return " ".join(text.split())
 
     def _normalize_danbooru_tags(self, text: str) -> str:
         text = (text or "").strip()
@@ -318,14 +378,11 @@ class DrawWithDuckPlugin(Star):
         return data
 
     def _build_node_info_list(self, prompt: str) -> list[dict[str, Any]]:
-        seed = random.randint(1, 2**31 - 1) if self.random_seed else 666
+        # workflow_input mode targets the workflow's text input node.
+        # final_clip mode targets the final CLIPTextEncode text field; the published
+        # workflow must leave that text widget unlinked so this value is not overwritten.
         items: list[dict[str, Any]] = [
             {"nodeId": self.prompt_node_id, "fieldName": self.prompt_field_name, "fieldValue": prompt},
-            {"nodeId": self.seed_node_id, "fieldName": "seed", "fieldValue": seed},
-            {"nodeId": self.seed_node_id, "fieldName": "steps", "fieldValue": self.default_steps},
-            {"nodeId": self.seed_node_id, "fieldName": "cfg", "fieldValue": self.default_cfg},
-            {"nodeId": self.width_node_id, "fieldName": "value", "fieldValue": self.default_width},
-            {"nodeId": self.height_node_id, "fieldName": "value", "fieldValue": self.default_height},
         ]
         if self.negative_prompt:
             items.append(
