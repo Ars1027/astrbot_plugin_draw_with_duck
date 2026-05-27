@@ -1,5 +1,6 @@
 import asyncio
 import json
+import random
 import re
 import time
 import traceback
@@ -23,6 +24,32 @@ DEFAULT_POSITIVE_TEMPLATE = (
 DUCK_DECODER_URL = "https://duck.airush.top/"
 VALID_OUTPUT_IMAGE_MODES = {"decoded", "duck"}
 VALID_PROMPT_DELIVERY_MODES = {"workflow_input", "final_clip"}
+VALID_PROMPT_OUTPUT_STYLES = {"danbooru_tags", "skill_mixed", "natural_english"}
+VALID_ARTIST_MODES = {"none", "fixed", "random"}
+DEFAULT_ARTIST_IDS = (
+    "@tare",
+    "@umi",
+    "@hjl",
+    "@unohana_pochiko",
+    "@ningen_mame",
+    "@sugimura_tomokazu",
+    "@jyt",
+    "@navy",
+    "@seungju_lee",
+    "@herio",
+    "@c.honey",
+    "@nahanmin",
+    "@misheng_liu_yin",
+    "@haruki_(colorful_macaron)",
+    "@daeho_cha",
+    "@yusan",
+    "@yue",
+    "@mokokoiro",
+    "@renge",
+    "@minowa_sukyaru",
+    "@chigusa_minori",
+)
+DEFAULT_ARTIST_RANDOM_LIST = "\n".join(DEFAULT_ARTIST_IDS)
 FALLBACK_PROMPT_SKILL = (
     "You are an ANIMA3 prompt engineer for anime text-to-image generation. "
     "Translate and enhance the user's idea into one concise English positive prompt. "
@@ -46,7 +73,7 @@ def _as_bool(value: Any, default: bool = False) -> bool:
     "astrbot_plugin_draw_with_duck",
     "Luochang",
     "按 SKILL.md 规则增强并翻译提示词，调用 RunningHub 生成鸭子图并用 SS_tools 解码后返回图片",
-    "v1.0.9",
+    "v1.1.1",
 )
 class DrawWithDuckPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -72,12 +99,27 @@ class DrawWithDuckPlugin(Star):
         self.duck_password = str(config.get("duck_password", "") or "")
 
         self.enhance_prompt = _as_bool(config.get("enhance_prompt", True), True)
-        self.prompt_danbooru_tag_format = _as_bool(
-            config.get("prompt_danbooru_tag_format", True), True
-        )
+        legacy_danbooru_format = _as_bool(config.get("prompt_danbooru_tag_format", True), True)
+        self.prompt_output_style = str(config.get("prompt_output_style", "") or "").strip().lower()
+        if not self.prompt_output_style:
+            self.prompt_output_style = "danbooru_tags" if legacy_danbooru_format else "skill_mixed"
+        if self.prompt_output_style not in VALID_PROMPT_OUTPUT_STYLES:
+            logger.warning(
+                f"invalid prompt_output_style={self.prompt_output_style}, fallback by legacy config"
+            )
+            self.prompt_output_style = "danbooru_tags" if legacy_danbooru_format else "skill_mixed"
+        self.prompt_danbooru_tag_format = self.prompt_output_style == "danbooru_tags"
         self.prompt_provider_id = str(config.get("prompt_provider_id", "") or "").strip()
         self.prompt_template = str(
             config.get("prompt_template", DEFAULT_POSITIVE_TEMPLATE) or DEFAULT_POSITIVE_TEMPLATE
+        )
+        self.artist_mode = str(config.get("artist_mode", "none") or "none").strip().lower()
+        if self.artist_mode not in VALID_ARTIST_MODES:
+            logger.warning(f"invalid artist_mode={self.artist_mode}, fallback to none")
+            self.artist_mode = "none"
+        self.artist_id = self._normalize_artist_id(str(config.get("artist_id", "") or ""))
+        self.artist_random_list = str(
+            config.get("artist_random_list", DEFAULT_ARTIST_RANDOM_LIST) or DEFAULT_ARTIST_RANDOM_LIST
         )
         self.prompt_delivery_mode = str(
             config.get("prompt_delivery_mode", "workflow_input") or "workflow_input"
@@ -159,6 +201,8 @@ class DrawWithDuckPlugin(Star):
             "raw_prompt": raw_prompt,
             "enhanced_prompt": enhanced_prompt,
             "final_prompt": final_prompt,
+            "prompt_output_style": self.prompt_output_style,
+            "artist_mode": self.artist_mode,
             "prompt_delivery_mode": self.prompt_delivery_mode,
             "created_at": time.time(),
         }
@@ -209,11 +253,7 @@ class DrawWithDuckPlugin(Star):
             return self._format_enhanced_prompt(prompt) or prompt
 
         system_prompt = self._build_prompt_system_prompt()
-        user_prompt = (
-            "User idea:\n"
-            f"{prompt}\n\n"
-            "Return only the final one-line prompt."
-        )
+        user_prompt = self._build_prompt_user_prompt(prompt)
 
         for attempt in range(2):
             try:
@@ -233,12 +273,33 @@ class DrawWithDuckPlugin(Star):
 
     def _build_prompt_system_prompt(self) -> str:
         skill_text = self._load_prompt_skill()
-        format_rule = (
-            "After following the skill, force the final output into strict Danbooru-style tags: "
-            "lowercase English, comma-separated, underscores instead of spaces, no natural-language sentences."
-            if self.prompt_danbooru_tag_format
-            else "After following the skill, keep its output protocol: tags first, with a short English natural-language supplement at the end only when the skill says it is needed."
-        )
+        if self.prompt_output_style == "danbooru_tags":
+            format_rule = (
+                "After following the skill, force the final output into strict Danbooru-style tags: "
+                "lowercase English, comma-separated, underscores instead of spaces, no natural-language sentences."
+            )
+        elif self.prompt_output_style == "natural_english":
+            format_rule = (
+                "Natural English output protocol overrides any conflicting output-format instructions in the skill. "
+                "Return exactly one line in this shape: "
+                "'1girl, solo, Character Name, Series Title, A natural English sentence... Another sentence...'. "
+                "The prefix must contain only 3-6 short comma-separated basics: subject count, solo/group, "
+                "character name, series title, and essential identity tags. Do not put appearance, clothing, "
+                "expression, pose, action, background, lighting, mood, or style details into the prefix as tags. "
+                "Write those details as 2-3 complete natural English sentences, about 35-80 English words after "
+                "the prefix. Preserve proper capitalization, character names, series titles, and punctuation. "
+                "Do not force underscores. Do not output a pure tag list. "
+                "Example input: 伊地知虹夏微笑站在日本街道. "
+                "Example output: 1girl, solo, Ijichi Nijika, Bocchi the Rock!, A cheerful anime girl, Ijichi Nijika, "
+                "is smiling while standing on a Japanese street during the daytime. She has short blonde hair "
+                "with a side ponytail and bright yellow eyes. The atmosphere is warm, lively, and relaxed, "
+                "with soft natural light, clean line art, and delicate anime-style details."
+            )
+        else:
+            format_rule = (
+                "After following the skill, keep its output protocol: tags first, with a short English "
+                "natural-language supplement at the end only when the skill says it is needed."
+            )
         return (
             f"{skill_text}\n\n"
             "Runtime constraints for this plugin:\n"
@@ -246,6 +307,20 @@ class DrawWithDuckPlugin(Star):
             "- Output only the final positive prompt as one plain-text line.\n"
             "- Do not output explanations, markdown, code fences, JSON, headings, self-check notes, or negative prompt.\n"
             f"- {format_rule}"
+        )
+
+    def _build_prompt_user_prompt(self, prompt: str) -> str:
+        if self.prompt_output_style == "natural_english":
+            return (
+                "User idea:\n"
+                f"{prompt}\n\n"
+                "Return only the final one-line positive prompt. Use a short 3-6 item tag prefix, "
+                "then 2-3 complete natural English sentences. Do not return a pure comma-separated tag list."
+            )
+        return (
+            "User idea:\n"
+            f"{prompt}\n\n"
+            "Return only the final one-line prompt."
         )
 
     def _load_prompt_skill(self) -> str:
@@ -303,10 +378,25 @@ class DrawWithDuckPlugin(Star):
         return self._format_enhanced_prompt(text)
 
     def _format_enhanced_prompt(self, text: str) -> str:
+        if self.prompt_output_style == "natural_english":
+            return self._clean_natural_english_prompt(text)
         cleaned = self._clean_prompt_text(text)
-        if self.prompt_danbooru_tag_format:
+        if self.prompt_output_style == "danbooru_tags":
             return self._normalize_danbooru_tags(cleaned)
         return cleaned
+
+    def _clean_natural_english_prompt(self, text: str) -> str:
+        text = text.strip()
+        text = re.sub(r"^```(?:\w+)?", "", text).strip()
+        text = re.sub(r"```$", "", text).strip()
+        text = text.strip("\"'` \n\r\t")
+        text = re.sub(r"^\s*(?:[-*+•]|\d+[\.)]|[a-zA-Z][\.)])\s+", "", text, flags=re.MULTILINE)
+        text = re.sub(r"\b(?:positive\s*)?prompt\s*[:：]", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\b(?:tags?|danbooru\s*tags?)\s*[:：]", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"[\n\r]+", " ", text)
+        text = re.sub(r"(,\s*){2,}", ", ", text)
+        text = re.sub(r"\s+([,.!?;:])", r"\1", text)
+        return " ".join(text.split())
 
     def _clean_prompt_text(self, text: str) -> str:
         text = text.strip()
@@ -317,6 +407,8 @@ class DrawWithDuckPlugin(Star):
         text = re.sub(r"\b(?:positive\s*)?prompt\s*[:：]", "", text, flags=re.IGNORECASE)
         text = re.sub(r"\b(?:tags?|danbooru\s*tags?)\s*[:：]", "", text, flags=re.IGNORECASE)
         text = re.sub(r"[\n\r]+", ", ", text)
+        text = re.sub(r"(,\s*){2,}", ", ", text)
+        text = re.sub(r"\s+([,.!?;:])", r"\1", text)
         return " ".join(text.split())
 
     def _normalize_danbooru_tags(self, text: str) -> str:
@@ -355,7 +447,53 @@ class DrawWithDuckPlugin(Star):
             final_prompt = self.prompt_template.format(prompt=prompt)
         except Exception:
             final_prompt = DEFAULT_POSITIVE_TEMPLATE.format(prompt=prompt)
-        return final_prompt.strip()
+        return self._apply_artist_prompt(final_prompt.strip())
+
+    def _apply_artist_prompt(self, prompt: str) -> str:
+        artist = self._select_artist_id()
+        if not artist:
+            return prompt
+        if self._prompt_has_artist(prompt, artist):
+            return prompt
+        if not prompt:
+            return artist
+        return f"{artist}, {prompt}"
+
+    def _select_artist_id(self) -> str:
+        if self.artist_mode == "none":
+            return ""
+        if self.artist_mode == "fixed":
+            return self.artist_id
+        artists = self._parse_artist_list(self.artist_random_list)
+        if not artists:
+            artists = list(DEFAULT_ARTIST_IDS)
+        return random.choice(artists)
+
+    def _parse_artist_list(self, text: str) -> list[str]:
+        artists: list[str] = []
+        seen: set[str] = set()
+        for raw_artist in re.split(r"[\n\r,;，；、]+|(?=@)", text or ""):
+            artist = self._normalize_artist_id(raw_artist)
+            if not artist or artist in seen:
+                continue
+            seen.add(artist)
+            artists.append(artist)
+        return artists
+
+    def _normalize_artist_id(self, artist: str) -> str:
+        artist = (artist or "").strip().strip("\"'`")
+        if not artist:
+            return ""
+        artist = artist.lstrip("@").strip().lower()
+        artist = re.sub(r"\s+", "_", artist)
+        artist = re.sub(r"_+", "_", artist)
+        artist = re.sub(r"[^a-z0-9_().+-]", "", artist).strip("_")
+        if not artist:
+            return ""
+        return f"@{artist}"
+
+    def _prompt_has_artist(self, prompt: str, artist: str) -> bool:
+        return bool(re.search(rf"(?<![a-zA-Z0-9_]){re.escape(artist)}(?![a-zA-Z0-9_])", prompt, re.IGNORECASE))
 
     async def _submit_task(self, prompt: str) -> dict[str, Any]:
         node_info_list = self._build_node_info_list(prompt)

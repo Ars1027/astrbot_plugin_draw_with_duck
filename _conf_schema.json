@@ -50,10 +50,17 @@
     "default": true
   },
   "prompt_danbooru_tag_format": {
-    "description": "最终提示词是否强制符合 Danbooru tag 格式",
+    "description": "兼容旧配置：最终提示词是否强制符合 Danbooru tag 格式",
     "type": "bool",
     "default": true,
-    "hint": "开启后输出会被规范化为小写、下划线、英文逗号分隔的 tag；关闭后保留 SKILL.md 允许的英文自然语言补充短句"
+    "hint": "新配置 prompt_output_style 优先生效；未配置 prompt_output_style 时，开启=danbooru_tags，关闭=skill_mixed"
+  },
+  "prompt_output_style": {
+    "description": "提示词增强输出风格",
+    "type": "string",
+    "default": "danbooru_tags",
+    "options": ["danbooru_tags", "skill_mixed", "natural_english"],
+    "hint": "danbooru_tags=严格 Danbooru tag；skill_mixed=遵循 SKILL.md 的 tag+短句；natural_english=少量基础 tags + 2-3 句英文自然语言画面描述，不是纯 tag 模式"
   },
   "prompt_provider_id": {
     "description": "提示词增强/翻译使用的模型 Provider",
@@ -71,6 +78,26 @@
     "description": "最终正向提示词模板，使用 {prompt} 插入增强后的最终 prompt",
     "type": "text",
     "default": "masterpiece, best_quality, amazing_quality, detailed, newest, anime_coloring, anime_screenshot, {prompt}"
+  },
+  "artist_mode": {
+    "description": "画师选择模式",
+    "type": "string",
+    "default": "none",
+    "options": ["none", "fixed", "random"],
+    "hint": "none=不添加画师；fixed=使用指定画师；random=从随机画师列表中每次抽取一个"
+  },
+  "artist_id": {
+    "description": "指定画师 ID",
+    "type": "string",
+    "default": "",
+    "options": ["", "@tare", "@umi", "@hjl", "@unohana_pochiko", "@ningen_mame", "@sugimura_tomokazu", "@jyt", "@navy", "@seungju_lee", "@herio", "@c.honey", "@nahanmin", "@misheng_liu_yin", "@haruki_(colorful_macaron)", "@daeho_cha", "@yusan", "@yue", "@mokokoiro", "@renge", "@minowa_sukyaru", "@chigusa_minori"],
+    "hint": "仅 artist_mode=fixed 时使用；多单词画师会自动用下划线连接并补 @"
+  },
+  "artist_random_list": {
+    "description": "随机画师候选列表",
+    "type": "text",
+    "default": "@tare\n@umi\n@hjl\n@unohana_pochiko\n@ningen_mame\n@sugimura_tomokazu\n@jyt\n@navy\n@seungju_lee\n@herio\n@c.honey\n@nahanmin\n@misheng_liu_yin\n@haruki_(colorful_macaron)\n@daeho_cha\n@yusan\n@yue\n@mokokoiro\n@renge\n@minowa_sukyaru\n@chigusa_minori",
+    "hint": "仅 artist_mode=random 时使用；支持换行、逗号、分号分隔，也支持 @tare@umi 这种连续写法"
   },
   "prompt_delivery_mode": {
     "description": "提示词送入工作流的方式",
