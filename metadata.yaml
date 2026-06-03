@@ -1,7 +1,7 @@
 name: astrbot_plugin_draw_with_duck
 display_name: 鸭子图画图
 desc: 增强并翻译提示词，调用 RunningHub 生成鸭子图，并按配置返回原图或鸭子图。
-version: v1.1.0
+version: v1.2.0
 author: Ars1027
 repo: "https://github.com/Ars1027/astrbot_plugin_draw_with_duck"
 support_platforms:

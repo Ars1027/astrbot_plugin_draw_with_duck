@@ -22,10 +22,71 @@ DEFAULT_POSITIVE_TEMPLATE = (
     "anime_screenshot, {prompt}"
 )
 DUCK_DECODER_URL = "https://duck.airush.top/"
+DEFAULT_R18_WORKFLOW_ID = "2060002715337584642"
 VALID_OUTPUT_IMAGE_MODES = {"decoded", "duck"}
 VALID_PROMPT_DELIVERY_MODES = {"workflow_input", "final_clip"}
 VALID_PROMPT_OUTPUT_STYLES = {"danbooru_tags", "skill_mixed", "natural_english"}
 VALID_ARTIST_MODES = {"none", "fixed", "random"}
+R18_ROUTE_NORMAL = "normal"
+R18_ROUTE_R18 = "r18"
+R18_PROMPT_TERMS = (
+    "nsfw",
+    "r18",
+    "r 18",
+    "18+",
+    "adult content",
+    "rating explicit",
+    "rating_explicit",
+    "explicit",
+    "erotic",
+    "porn",
+    "hentai",
+    "nude",
+    "naked",
+    "nudity",
+    "topless",
+    "bottomless",
+    "nipples",
+    "areola",
+    "genitals",
+    "penis",
+    "vagina",
+    "pussy",
+    "sex",
+    "sexual",
+    "intercourse",
+    "oral sex",
+    "fellatio",
+    "cunnilingus",
+    "masturbation",
+    "ejaculation",
+    "cum",
+    "semen",
+    "orgasm",
+    "anal",
+    "bdsm",
+    "bondage",
+)
+R18_CJK_TERMS = (
+    "r18",
+    "r-18",
+    "nsfw",
+    "成人",
+    "色情",
+    "裸",
+    "裸体",
+    "全裸",
+    "露点",
+    "乳头",
+    "生殖器",
+    "阴茎",
+    "阴道",
+    "私处",
+    "性爱",
+    "性交",
+    "做爱",
+    "口交",
+)
 DEFAULT_ARTIST_IDS = (
     "@tare",
     "@umi",
@@ -73,7 +134,7 @@ def _as_bool(value: Any, default: bool = False) -> bool:
     "astrbot_plugin_draw_with_duck",
     "Luochang",
     "按 SKILL.md 规则增强并翻译提示词，调用 RunningHub 生成鸭子图并用 SS_tools 解码后返回图片",
-    "v1.1.1",
+    "v1.1.2",
 )
 class DrawWithDuckPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -82,6 +143,11 @@ class DrawWithDuckPlugin(Star):
 
         self.api_key = str(config.get("runninghub_api_key", "") or "").strip()
         self.workflow_id = str(config.get("workflow_id", "2055280648360873986") or "").strip()
+        self.r18_review_enabled = _as_bool(config.get("r18_review_enabled", False), False)
+        self.r18_api_key = str(config.get("r18_api_key", "") or "").strip()
+        self.r18_workflow_id = str(
+            config.get("r18_workflow_id", DEFAULT_R18_WORKFLOW_ID) or DEFAULT_R18_WORKFLOW_ID
+        ).strip()
         self.api_base = str(config.get("api_base", "https://www.runninghub.ai") or "").rstrip("/")
         self.query_api_base = str(
             config.get("query_api_base", self.api_base) or self.api_base
@@ -171,7 +237,10 @@ class DrawWithDuckPlugin(Star):
 
         raw_prompt = self._extract_command_arg(event.message_str)
         if not raw_prompt:
-            yield event.plain_result("用法：/画图 提示词\n例如：/画图 蓝发机器人少女，夜晚水面，赛博朋克")
+            yield event.plain_result(
+                "用法：/画图 提示词\n"
+                "例如：/画图 蓝发机器人少女，夜晚水面，赛博朋克"
+            )
             return
 
         config_error = self._check_config()
@@ -183,8 +252,12 @@ class DrawWithDuckPlugin(Star):
 
         try:
             enhanced_prompt = await self._enhance_prompt(event, raw_prompt)
+            route = self._select_runninghub_route(enhanced_prompt)
             final_prompt = self._build_final_prompt(enhanced_prompt)
-            task_resp = await self._submit_task(final_prompt)
+            logger.info(
+                f"submitting draw task route={route['mode']} workflow_id={route['workflow_id']}"
+            )
+            task_resp = await self._submit_task(final_prompt, route)
             task_id = self._extract_task_id(task_resp)
             if not task_id:
                 yield event.plain_result(f"RunningHub 未返回 taskId：{self._brief_json(task_resp)}")
@@ -204,9 +277,23 @@ class DrawWithDuckPlugin(Star):
             "prompt_output_style": self.prompt_output_style,
             "artist_mode": self.artist_mode,
             "prompt_delivery_mode": self.prompt_delivery_mode,
+            "route_mode": route["mode"],
+            "workflow_id": route["workflow_id"],
             "created_at": time.time(),
         }
-        await self.put_kv_data(f"duck_task_{task_id}", json.dumps(task_info, ensure_ascii=False))
+        try:
+            await self.put_kv_data(f"duck_task_{task_id}", json.dumps(task_info, ensure_ascii=False))
+        except Exception as exc:
+            logger.error(f"save duck task info failed: {traceback.format_exc()}")
+            msg = (
+                f"任务已提交：{task_id}\n"
+                f"但后台轮询记录失败，插件无法自动取图。请稍后在 RunningHub 查询任务结果，"
+                f"或重试绘图。错误：{exc}"
+            )
+            if self.show_enhanced_prompt:
+                msg += f"\n最终正向提示词：{final_prompt}"
+            yield event.plain_result(msg)
+            return
 
         msg = f"任务已提交：{task_id}"
         if self.show_enhanced_prompt:
@@ -495,7 +582,58 @@ class DrawWithDuckPlugin(Star):
     def _prompt_has_artist(self, prompt: str, artist: str) -> bool:
         return bool(re.search(rf"(?<![a-zA-Z0-9_]){re.escape(artist)}(?![a-zA-Z0-9_])", prompt, re.IGNORECASE))
 
-    async def _submit_task(self, prompt: str) -> dict[str, Any]:
+    def _select_runninghub_route(self, enhanced_prompt: str) -> dict[str, str]:
+        if not self.r18_review_enabled:
+            return self._normal_runninghub_route()
+        if not self._is_r18_prompt(enhanced_prompt):
+            return self._normal_runninghub_route()
+        if not self.r18_api_key:
+            raise RuntimeError("增强后的提示词被判定为 R18，但未配置 r18_api_key。")
+        if not self.r18_workflow_id:
+            raise RuntimeError("增强后的提示词被判定为 R18，但未配置 r18_workflow_id。")
+        return {
+            "mode": R18_ROUTE_R18,
+            "api_key": self.r18_api_key,
+            "workflow_id": self.r18_workflow_id,
+            "api_base": self.api_base,
+            "query_api_base": self.query_api_base,
+        }
+
+    def _normal_runninghub_route(self) -> dict[str, str]:
+        return {
+            "mode": R18_ROUTE_NORMAL,
+            "api_key": self.api_key,
+            "workflow_id": self.workflow_id,
+            "api_base": self.api_base,
+            "query_api_base": self.query_api_base,
+        }
+
+    def _route_from_task_info(self, task_info: dict[str, Any]) -> dict[str, str]:
+        if task_info.get("route_mode") == R18_ROUTE_R18:
+            if not self.r18_api_key:
+                raise RuntimeError("R18 任务需要使用 r18_api_key 查询结果，但当前未配置 r18_api_key。")
+            return {
+                "mode": R18_ROUTE_R18,
+                "api_key": self.r18_api_key,
+                "workflow_id": str(task_info.get("workflow_id") or self.r18_workflow_id),
+                "api_base": self.api_base,
+                "query_api_base": self.query_api_base,
+            }
+        return self._normal_runninghub_route()
+
+    def _is_r18_prompt(self, prompt: str) -> bool:
+        text = (prompt or "").strip().lower()
+        if not text:
+            return False
+        normalized = re.sub(r"[_\-]+", " ", text)
+        normalized = re.sub(r"\s+", " ", normalized)
+        for term in R18_PROMPT_TERMS:
+            pattern = rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])"
+            if re.search(pattern, normalized, flags=re.IGNORECASE):
+                return True
+        return any(term in text for term in R18_CJK_TERMS)
+
+    async def _submit_task(self, prompt: str, route: dict[str, str]) -> dict[str, Any]:
         node_info_list = self._build_node_info_list(prompt)
         payload: dict[str, Any] = {
             "addMetadata": self.add_metadata,
@@ -506,8 +644,8 @@ class DrawWithDuckPlugin(Star):
         if self.retain_seconds > 0:
             payload["retainSeconds"] = self.retain_seconds
 
-        headers = self._headers(with_bearer=True)
-        url = f"{self.api_base}/openapi/v2/run/workflow/{self.workflow_id}"
+        headers = self._headers(with_bearer=True, api_key=route["api_key"])
+        url = f"{route['api_base']}/openapi/v2/run/workflow/{route['workflow_id']}"
         assert self.session is not None
         async with self.session.post(url, json=payload, headers=headers) as resp:
             data = await self._read_json_response(resp)
@@ -540,10 +678,10 @@ class DrawWithDuckPlugin(Star):
             )
         return items
 
-    def _headers(self, with_bearer: bool = False) -> dict[str, str]:
+    def _headers(self, with_bearer: bool = False, api_key: str | None = None) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
         if with_bearer:
-            headers["Authorization"] = f"Bearer {self.api_key}"
+            headers["Authorization"] = f"Bearer {api_key or self.api_key}"
         return headers
 
     async def _read_json_response(self, resp: aiohttp.ClientResponse) -> dict[str, Any]:
@@ -571,8 +709,9 @@ class DrawWithDuckPlugin(Star):
 
         task_info = json.loads(raw)
         umo = task_info.get("umo")
+        route = self._route_from_task_info(task_info)
         try:
-            outputs = await self._poll_outputs(task_id)
+            outputs = await self._poll_outputs(task_id, route)
             duck_url = self._pick_first_url(outputs)
             if not duck_url:
                 raise RuntimeError(f"no output url in response: {self._brief_json(outputs)}")
@@ -598,7 +737,7 @@ class DrawWithDuckPlugin(Star):
             except Exception as send_exc:
                 logger.warning(f"failed to send failure message: {send_exc}")
 
-    async def _poll_outputs(self, task_id: str) -> dict[str, Any]:
+    async def _poll_outputs(self, task_id: str, route: dict[str, str]) -> dict[str, Any]:
         deadline = time.time() + self.timeout_seconds
         last_data: dict[str, Any] = {}
 
@@ -607,7 +746,7 @@ class DrawWithDuckPlugin(Star):
                 break
 
             try:
-                data = await self._query_v2(task_id)
+                data = await self._query_v2(task_id, route)
                 last_data = data
                 status = self._extract_status(data)
                 if status == "SUCCESS":
@@ -620,7 +759,7 @@ class DrawWithDuckPlugin(Star):
                 logger.warning(f"v2 query failed, trying legacy outputs: {exc}")
 
             try:
-                legacy = await self._query_legacy_outputs(task_id)
+                legacy = await self._query_legacy_outputs(task_id, route)
                 if isinstance(legacy.get("data"), list) and legacy["data"]:
                     return legacy
                 last_data = legacy
@@ -631,17 +770,17 @@ class DrawWithDuckPlugin(Star):
 
         raise TimeoutError(f"RunningHub task timeout, last response: {self._brief_json(last_data)}")
 
-    async def _query_v2(self, task_id: str) -> dict[str, Any]:
+    async def _query_v2(self, task_id: str, route: dict[str, str]) -> dict[str, Any]:
         assert self.session is not None
-        url = f"{self.query_api_base}/openapi/v2/query"
-        headers = self._headers(with_bearer=True)
+        url = f"{route['query_api_base']}/openapi/v2/query"
+        headers = self._headers(with_bearer=True, api_key=route["api_key"])
         async with self.session.post(url, json={"taskId": task_id}, headers=headers) as resp:
             return await self._read_json_response(resp)
 
-    async def _query_legacy_outputs(self, task_id: str) -> dict[str, Any]:
+    async def _query_legacy_outputs(self, task_id: str, route: dict[str, str]) -> dict[str, Any]:
         assert self.session is not None
-        url = f"{self.api_base}/task/openapi/outputs"
-        payload = {"apiKey": self.api_key, "taskId": task_id}
+        url = f"{route['api_base']}/task/openapi/outputs"
+        payload = {"apiKey": route["api_key"], "taskId": task_id}
         async with self.session.post(url, json=payload, headers=self._headers()) as resp:
             return await self._read_json_response(resp)
 

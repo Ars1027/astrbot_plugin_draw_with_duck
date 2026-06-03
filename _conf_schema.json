@@ -11,6 +11,25 @@
     "default": "2055280648360873986",
     "hint": "已默认填入你发布的工作流 ID"
   },
+  "r18_review_enabled": {
+    "description": "是否开启 R18 提示词审查与自动路由",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后会检查增强后的提示词；命中 R18 时使用 R18 专用 API Key 和工作流"
+  },
+  "r18_api_key": {
+    "description": "R18 专用 RunningHub API Key",
+    "type": "string",
+    "default": "",
+    "hint": "仅在开启 R18 审查且增强后的提示词命中 R18 时使用",
+    "obvious_hint": true
+  },
+  "r18_workflow_id": {
+    "description": "R18 专用 RunningHub 工作流 ID",
+    "type": "string",
+    "default": "2060002715337584642",
+    "hint": "R18 工作流节点 ID 需与普通工作流一致"
+  },
   "api_base": {
     "description": "RunningHub API 基础地址",
     "type": "string",

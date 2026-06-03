@@ -10,6 +10,7 @@ AstrBot 鸭子图绘图插件。用户发送 `/画图 提示词` 后，插件会
 - 可配置最终 prompt 是否强制规范化为 Danbooru tag 格式；不会联网校验真实 Danbooru tag 库。
 - 可选择提示词输出风格：严格 Danbooru tag、SKILL.md 混合格式，或基础 tag + 英文自然语言描述。
 - 可配置画师：不添加、指定一个画师，或每次从候选列表随机抽取。
+- 可选开启 R18 审查：基于增强后的提示词本地判断，命中后自动切换到 R18 专用 RunningHub API Key 和工作流。
 - 可配置提示词送入方式：写入工作流内部提示词输入节点，或由插件端生成最终 prompt 后直接写入最终 CLIPTextEncode。
 - 调用 RunningHub `/openapi/v2/run/workflow/{workflowId}` 提交已发布工作流。
 - 下载鸭子图后本地解码，可按配置发送解码后的原图或未解码的鸭子图。
@@ -26,6 +27,9 @@ AstrBot 鸭子图绘图插件。用户发送 `/画图 提示词` 后，插件会
 常用可选项：
 
 - `output_image_mode`：输出图片模式。`decoded` 发送解码后的原图；`duck` 发送未解码的鸭子图并附带在线解码地址。
+- `r18_review_enabled`：是否开启 R18 审查与自动路由。开启后会检查增强/翻译后的提示词，不联网、不调用 LLM 审查。
+- `r18_api_key`：R18 专用 RunningHub API Key。仅在开启审查且命中 R18 时使用。
+- `r18_workflow_id`：R18 专用工作流 ID，默认 `2060002715337584642`。该工作流需与普通工作流使用相同节点 ID。
 - `prompt_output_style`：提示词增强输出风格。`danbooru_tags` 为严格 tag；`skill_mixed` 遵循 `SKILL.md` 的 tag + 短句；`natural_english` 为少量基础 tag + 2-3 句英文自然语言画面描述，不是纯 tag 模式。
 - `prompt_danbooru_tag_format`：兼容旧配置。未配置 `prompt_output_style` 时才会用于映射输出风格。
 - `prompt_delivery_mode`：提示词送入方式。`workflow_input` 适合把 prompt 写入工作流内部输入节点；`final_clip` 适合插件端生成最终 prompt 后直接写入最终 CLIPTextEncode.text。
