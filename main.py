@@ -27,6 +27,11 @@ VALID_OUTPUT_IMAGE_MODES = {"decoded", "duck"}
 VALID_PROMPT_DELIVERY_MODES = {"workflow_input", "final_clip"}
 VALID_PROMPT_OUTPUT_STYLES = {"danbooru_tags", "skill_mixed", "natural_english"}
 VALID_ARTIST_MODES = {"none", "fixed", "random"}
+PROMPT_ENHANCEMENT_DISABLED = "disabled"
+PROMPT_ENHANCEMENT_SUCCESS = "enhanced"
+PROMPT_ENHANCEMENT_NO_PROVIDER = "no_provider_fallback"
+PROMPT_ENHANCEMENT_TIMEOUT = "timeout_fallback"
+PROMPT_ENHANCEMENT_FAILED = "error_fallback"
 R18_ROUTE_NORMAL = "normal"
 R18_ROUTE_R18 = "r18"
 R18_PROMPT_TERMS = (
@@ -134,7 +139,7 @@ def _as_bool(value: Any, default: bool = False) -> bool:
     "astrbot_plugin_draw_with_duck",
     "Luochang",
     "按 SKILL.md 规则增强并翻译提示词，调用 RunningHub 生成鸭子图并用 SS_tools 解码后返回图片",
-    "v1.1.2",
+    "v1.2.1",
 )
 class DrawWithDuckPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -176,6 +181,9 @@ class DrawWithDuckPlugin(Star):
             self.prompt_output_style = "danbooru_tags" if legacy_danbooru_format else "skill_mixed"
         self.prompt_danbooru_tag_format = self.prompt_output_style == "danbooru_tags"
         self.prompt_provider_id = str(config.get("prompt_provider_id", "") or "").strip()
+        self.prompt_timeout_seconds = max(
+            10, int(config.get("prompt_timeout_seconds", 120) or 120)
+        )
         self.prompt_template = str(
             config.get("prompt_template", DEFAULT_POSITIVE_TEMPLATE) or DEFAULT_POSITIVE_TEMPLATE
         )
@@ -233,86 +241,104 @@ class DrawWithDuckPlugin(Star):
 
     @filter.command("画图", alias={"drawduck", "duckdraw"}, priority=1)
     async def draw(self, event: AstrMessageEvent):
-        event.stop_event()
-
-        raw_prompt = self._extract_command_arg(event.message_str)
-        if not raw_prompt:
-            yield event.plain_result(
-                "用法：/画图 提示词\n"
-                "例如：/画图 蓝发机器人少女，夜晚水面，赛博朋克"
-            )
-            return
-
-        config_error = self._check_config()
-        if config_error:
-            yield event.plain_result(config_error)
-            return
-
-        yield event.plain_result("收到，正在润色提示词并提交 RunningHub 任务。")
-
         try:
-            enhanced_prompt = await self._enhance_prompt(event, raw_prompt)
-            route = self._select_runninghub_route(enhanced_prompt)
-            final_prompt = self._build_final_prompt(enhanced_prompt)
-            logger.info(
-                f"submitting draw task route={route['mode']} workflow_id={route['workflow_id']}"
-            )
-            task_resp = await self._submit_task(final_prompt, route)
-            task_id = self._extract_task_id(task_resp)
-            if not task_id:
-                yield event.plain_result(f"RunningHub 未返回 taskId：{self._brief_json(task_resp)}")
+            raw_prompt = self._extract_command_arg(event.message_str)
+            if not raw_prompt:
+                yield event.plain_result(
+                    "用法：/画图 提示词\n"
+                    "例如：/画图 蓝发机器人少女，夜晚水面，赛博朋克"
+                )
                 return
-        except Exception as exc:
-            logger.error(f"submit draw task failed: {traceback.format_exc()}")
-            yield event.plain_result(f"提交任务失败：{exc}")
-            return
 
-        task_info = {
-            "task_id": task_id,
-            "umo": event.unified_msg_origin,
-            "sender_id": str(event.get_sender_id()),
-            "raw_prompt": raw_prompt,
-            "enhanced_prompt": enhanced_prompt,
-            "final_prompt": final_prompt,
-            "prompt_output_style": self.prompt_output_style,
-            "artist_mode": self.artist_mode,
-            "prompt_delivery_mode": self.prompt_delivery_mode,
-            "route_mode": route["mode"],
-            "workflow_id": route["workflow_id"],
-            "created_at": time.time(),
-        }
-        try:
-            await self.put_kv_data(f"duck_task_{task_id}", json.dumps(task_info, ensure_ascii=False))
-        except Exception as exc:
-            logger.error(f"save duck task info failed: {traceback.format_exc()}")
-            msg = (
-                f"任务已提交：{task_id}\n"
-                f"但后台轮询记录失败，插件无法自动取图。请稍后在 RunningHub 查询任务结果，"
-                f"或重试绘图。错误：{exc}"
+            config_error = self._check_config()
+            if config_error:
+                yield event.plain_result(config_error)
+                return
+
+            yield event.plain_result("收到，正在润色提示词并提交 RunningHub 任务。")
+
+            try:
+                enhanced_prompt, enhancement_status = await self._enhance_prompt(
+                    event, raw_prompt
+                )
+                route = self._select_runninghub_route(enhanced_prompt)
+                final_prompt = self._build_final_prompt(enhanced_prompt)
+                logger.info(
+                    f"submitting draw task route={route['mode']} workflow_id={route['workflow_id']}"
+                )
+                task_resp = await self._submit_task(final_prompt, route)
+                task_id = self._extract_task_id(task_resp)
+                if not task_id:
+                    yield event.plain_result(
+                        f"RunningHub 未返回 taskId：{self._brief_json(task_resp)}"
+                    )
+                    return
+                logger.info(
+                    f"runninghub task submitted task_id={task_id} route={route['mode']}"
+                )
+            except Exception as exc:
+                logger.error(f"submit draw task failed: {traceback.format_exc()}")
+                yield event.plain_result(f"提交任务失败：{exc}")
+                return
+
+            task_info = {
+                "task_id": task_id,
+                "umo": event.unified_msg_origin,
+                "sender_id": str(event.get_sender_id()),
+                "raw_prompt": raw_prompt,
+                "enhanced_prompt": enhanced_prompt,
+                "prompt_enhancement_status": enhancement_status,
+                "final_prompt": final_prompt,
+                "prompt_output_style": self.prompt_output_style,
+                "artist_mode": self.artist_mode,
+                "prompt_delivery_mode": self.prompt_delivery_mode,
+                "route_mode": route["mode"],
+                "workflow_id": route["workflow_id"],
+                "created_at": time.time(),
+            }
+            try:
+                await self.put_kv_data(
+                    f"duck_task_{task_id}", json.dumps(task_info, ensure_ascii=False)
+                )
+            except Exception as exc:
+                logger.error(f"save duck task info failed: {traceback.format_exc()}")
+                msg = (
+                    f"任务已提交：{task_id}\n"
+                    f"但后台轮询记录失败，插件无法自动取图。请稍后在 RunningHub 查询任务结果，"
+                    f"或重试绘图。错误：{exc}"
+                )
+                msg += self._prompt_enhancement_notice(enhancement_status)
+                if self.show_enhanced_prompt:
+                    msg += f"\n最终正向提示词：{final_prompt}"
+                yield event.plain_result(msg)
+                return
+
+            task = asyncio.create_task(
+                self._background_polling(task_id, event.unified_msg_origin)
             )
+            self._tasks.add(task)
+            task.add_done_callback(self._on_background_task_done)
+            logger.info(f"background polling scheduled task_id={task_id}")
+
+            msg = f"任务已提交：{task_id}"
+            msg += self._prompt_enhancement_notice(enhancement_status)
             if self.show_enhanced_prompt:
                 msg += f"\n最终正向提示词：{final_prompt}"
             yield event.plain_result(msg)
-            return
-
-        msg = f"任务已提交：{task_id}"
-        if self.show_enhanced_prompt:
-            msg += f"\n最终正向提示词：{final_prompt}"
-        yield event.plain_result(msg)
-
-        task = asyncio.create_task(self._background_polling(task_id))
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        finally:
+            event.stop_event()
 
     @filter.command("画图帮助", alias={"duckdrawhelp"}, priority=1)
     async def draw_help(self, event: AstrMessageEvent):
-        event.stop_event()
-        yield event.plain_result(
-            "鸭子图绘图插件\n"
-            "用法：/画图 提示词\n"
-            "示例：/画图 蓝发机器人少女，夜晚水面，赛博朋克\n"
-            "流程：当前会话模型增强并翻译提示词 -> RunningHub 生成鸭子图 -> SS_tools 解码 -> 返回解码后的图片。"
-        )
+        try:
+            yield event.plain_result(
+                "鸭子图绘图插件\n"
+                "用法：/画图 提示词\n"
+                "示例：/画图 蓝发机器人少女，夜晚水面，赛博朋克\n"
+                "流程：当前会话模型增强并翻译提示词 -> RunningHub 生成鸭子图 -> SS_tools 解码 -> 返回解码后的图片。"
+            )
+        finally:
+            event.stop_event()
 
     def _extract_command_arg(self, message: str) -> str:
         text = (message or "").strip()
@@ -330,33 +356,91 @@ class DrawWithDuckPlugin(Star):
             return "请先在插件配置中填写 workflow_id，即 RunningHub 工作流 ID。"
         return ""
 
-    async def _enhance_prompt(self, event: AstrMessageEvent, prompt: str) -> str:
+    async def _enhance_prompt(
+        self, event: AstrMessageEvent, prompt: str
+    ) -> tuple[str, str]:
+        fallback_prompt = self._format_enhanced_prompt(prompt) or prompt
         if not self.enhance_prompt:
-            return self._format_enhanced_prompt(prompt) or prompt
+            logger.info("prompt enhancement disabled, using raw prompt")
+            return fallback_prompt, PROMPT_ENHANCEMENT_DISABLED
 
         provider_id = await self._get_prompt_provider_id(event.unified_msg_origin)
         if not provider_id:
             logger.warning("no available prompt provider, fallback to raw prompt")
-            return self._format_enhanced_prompt(prompt) or prompt
+            return fallback_prompt, PROMPT_ENHANCEMENT_NO_PROVIDER
 
         system_prompt = self._build_prompt_system_prompt()
         user_prompt = self._build_prompt_user_prompt(prompt)
+        started_at = time.monotonic()
+        deadline = started_at + self.prompt_timeout_seconds
+        logger.info(
+            f"prompt enhancement started provider_id={provider_id} "
+            f"timeout_seconds={self.prompt_timeout_seconds}"
+        )
 
         for attempt in range(2):
-            try:
-                resp = await self.context.llm_generate(
-                    chat_provider_id=provider_id,
-                    prompt=user_prompt,
-                    system_prompt=system_prompt,
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                elapsed = time.monotonic() - started_at
+                logger.warning(
+                    f"prompt enhancement timed out after {elapsed:.2f}s "
+                    f"provider_id={provider_id}, fallback to raw prompt"
                 )
-                text = self._format_enhanced_prompt(getattr(resp, "completion_text", "") or "")
+                return fallback_prompt, PROMPT_ENHANCEMENT_TIMEOUT
+            try:
+                resp = await asyncio.wait_for(
+                    self.context.llm_generate(
+                        chat_provider_id=provider_id,
+                        prompt=user_prompt,
+                        system_prompt=system_prompt,
+                    ),
+                    timeout=remaining,
+                )
+                text = self._format_enhanced_prompt(
+                    getattr(resp, "completion_text", "") or ""
+                )
                 if text:
-                    return text
+                    elapsed = time.monotonic() - started_at
+                    logger.info(
+                        f"prompt enhancement completed provider_id={provider_id} "
+                        f"elapsed_seconds={elapsed:.2f}"
+                    )
+                    return text, PROMPT_ENHANCEMENT_SUCCESS
+                logger.warning(
+                    f"prompt enhancement returned empty text ({attempt + 1}/2)"
+                )
+            except asyncio.TimeoutError:
+                elapsed = time.monotonic() - started_at
+                logger.warning(
+                    f"prompt enhancement timed out after {elapsed:.2f}s "
+                    f"provider_id={provider_id}, fallback to raw prompt"
+                )
+                return fallback_prompt, PROMPT_ENHANCEMENT_TIMEOUT
             except Exception as exc:
-                logger.warning(f"prompt enhancement failed ({attempt + 1}/2): {exc}")
-                await asyncio.sleep(1)
+                logger.warning(
+                    f"prompt enhancement failed ({attempt + 1}/2) "
+                    f"error_type={type(exc).__name__}"
+                )
+            if attempt == 0:
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    await asyncio.sleep(min(1, remaining))
 
-        return self._format_enhanced_prompt(prompt) or prompt
+        elapsed = time.monotonic() - started_at
+        logger.warning(
+            f"prompt enhancement exhausted retries after {elapsed:.2f}s "
+            f"provider_id={provider_id}, fallback to raw prompt"
+        )
+        return fallback_prompt, PROMPT_ENHANCEMENT_FAILED
+
+    def _prompt_enhancement_notice(self, status: str) -> str:
+        if status == PROMPT_ENHANCEMENT_TIMEOUT:
+            return "\n提示词润色超时，已使用原提示词继续提交。"
+        if status == PROMPT_ENHANCEMENT_NO_PROVIDER:
+            return "\n未找到可用的提示词模型，已使用原提示词继续提交。"
+        if status == PROMPT_ENHANCEMENT_FAILED:
+            return "\n提示词润色失败，已使用原提示词继续提交。"
+        return ""
 
     def _build_prompt_system_prompt(self) -> str:
         skill_text = self._load_prompt_skill()
@@ -701,37 +785,80 @@ class DrawWithDuckPlugin(Star):
             return str(task_data["taskId"])
         return ""
 
-    async def _background_polling(self, task_id: str):
-        raw = await self.get_kv_data(f"duck_task_{task_id}", default=None)
-        if not raw:
-            logger.error(f"task info not found: {task_id}")
+    def _on_background_task_done(self, task: asyncio.Task):
+        self._tasks.discard(task)
+        if task.cancelled():
             return
-
-        task_info = json.loads(raw)
-        umo = task_info.get("umo")
-        route = self._route_from_task_info(task_info)
         try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        if exc:
+            logger.error(
+                "unhandled background polling error "
+                f"error_type={type(exc).__name__}: {str(exc)[:500]}"
+            )
+
+    async def _background_polling(self, task_id: str, direct_umo: str):
+        notification_umo = direct_umo
+        task_info: dict[str, Any] = {"task_id": task_id, "umo": direct_umo}
+        try:
+            logger.info(f"background polling started task_id={task_id}")
+            raw = await self.get_kv_data(f"duck_task_{task_id}", default=None)
+            if not raw:
+                raise RuntimeError(f"task info not found: {task_id}")
+
+            parsed_task_info = json.loads(raw)
+            if not isinstance(parsed_task_info, dict):
+                raise RuntimeError(
+                    f"invalid task info format: {type(parsed_task_info).__name__}"
+                )
+            task_info.update(parsed_task_info)
+            task_info["task_id"] = task_id
+            saved_umo = task_info.get("umo")
+            if not notification_umo and saved_umo:
+                notification_umo = str(saved_umo)
+            task_info["umo"] = notification_umo
+            route = self._route_from_task_info(task_info)
             outputs = await self._poll_outputs(task_id, route)
             duck_url = self._pick_first_url(outputs)
             if not duck_url:
                 raise RuntimeError(f"no output url in response: {self._brief_json(outputs)}")
 
             paths = await self._download_and_decode(task_id, duck_url)
-            send_status = await self._send_result(umo, paths["decoded"], paths.get("duck"))
+            send_status = await self._send_result(
+                notification_umo, paths["decoded"], paths.get("duck")
+            )
             task_info["status"] = "completed"
             task_info["send_status"] = send_status
             task_info["output_image_mode"] = self.output_image_mode
             task_info["duck_url"] = duck_url
             task_info["decoded_path"] = paths["decoded"]
-            await self.put_kv_data(f"duck_task_{task_id}", json.dumps(task_info, ensure_ascii=False))
+            await self.put_kv_data(
+                f"duck_task_{task_id}", json.dumps(task_info, ensure_ascii=False)
+            )
             self._clean_old_files()
+            logger.info(f"background polling completed task_id={task_id}")
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.error(f"duck draw task failed: {traceback.format_exc()}")
+            logger.error(
+                f"background polling failed task_id={task_id}: {traceback.format_exc()}"
+            )
+            task_info["status"] = "failed"
+            task_info["error"] = str(exc)[:500]
+            try:
+                await self.put_kv_data(
+                    f"duck_task_{task_id}",
+                    json.dumps(task_info, ensure_ascii=False),
+                )
+            except Exception as save_exc:
+                logger.warning(
+                    f"failed to persist background task failure task_id={task_id}: {save_exc}"
+                )
             try:
                 await self.context.send_message(
-                    umo,
+                    notification_umo,
                     MessageChain().message(f"绘图或解码失败：{exc}"),
                 )
             except Exception as send_exc:

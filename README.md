@@ -37,6 +37,7 @@ AstrBot 鸭子图绘图插件。用户发送 `/画图 提示词` 后，插件会
 - `use_personal_queue`：是否使用个人独占队列。
 - `retain_seconds`：实例保留时长，通常仅企业共享 API Key 生效。
 - `prompt_provider_id`：提示词增强/翻译使用的模型 Provider，留空时自动选择当前会话模型。
+- `prompt_timeout_seconds`：提示词增强最长等待时间，默认 120 秒、最小 10 秒；超时后会使用原提示词继续提交 RunningHub，并在任务回执中说明已降级。
 - `prompt_template`：最终正向提示词模板，`{prompt}` 会替换为增强后的最终 prompt。
 - `artist_mode`：画师选择模式。`none` 不添加画师；`fixed` 使用 `artist_id`；`random` 从 `artist_random_list` 随机抽取。
 - `artist_id`：指定画师 ID。可以填 `unohana pochiko`，插件会规范化为 `@unohana_pochiko`。

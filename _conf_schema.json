@@ -88,6 +88,12 @@
     "hint": "留空时按顺序自动选择：当前会话模型 -> 第一个可用模型",
     "_special": "select_provider"
   },
+  "prompt_timeout_seconds": {
+    "description": "提示词增强最长等待时间（秒）",
+    "type": "int",
+    "default": 120,
+    "hint": "最小 10 秒；超时后使用原提示词继续提交 RunningHub"
+  },
   "show_enhanced_prompt": {
     "description": "提交后显示实际发送给 RunningHub 的最终正向提示词",
     "type": "bool",
