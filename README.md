@@ -1,17 +1,17 @@
 # astrbot_plugin_draw_with_duck
 
-AstrBot 鸭子图绘图插件。用户发送 `/画图 提示词` 后，插件会使用已配置模型按照同目录 `SKILL.md` 的 ANIMA3 规则增强并翻译提示词，调用 RunningHub 工作流生成鸭子图，再用 [copyangle/SS_tools](https://github.com/copyangle/SS_tools) 兼容解码逻辑提取原图。
+AstrBot 鸭子图绘图插件。用户发送 `/画图 提示词` 后，插件默认使用已配置模型按照同目录 `SKILL.md` 的 ANIMA3 规则增强并翻译提示词，调用 RunningHub 工作流生成鸭子图，再用 [copyangle/SS_tools](https://github.com/copyangle/SS_tools) 兼容解码逻辑提取原图。
 
 ## 功能
 
 - `/画图 <提示词>`：文生图。
 - `/画图帮助`：查看简要用法。
-- 可选择已配置的模型 Provider，按 `SKILL.md` 规则增强并翻译提示词。
+- 开启提示词增强时，可选择已配置的模型 Provider，按 `SKILL.md` 规则增强并翻译提示词。
 - 可配置最终 prompt 是否强制规范化为 Danbooru tag 格式；不会联网校验真实 Danbooru tag 库。
 - 可选择提示词输出风格：严格 Danbooru tag、SKILL.md 混合格式，或基础 tag + 英文自然语言描述。
 - 可配置画师：不添加、指定一个画师，或每次从候选列表随机抽取。
-- 可选开启 R18 审查：基于增强后的提示词本地判断，命中后自动切换到 R18 专用 RunningHub API Key 和工作流。
-- 可配置提示词送入方式：写入工作流内部提示词输入节点，或由插件端生成最终 prompt 后直接写入最终 CLIPTextEncode。
+- 可选开启 R18 审查：基于增强结果或英文直投提示词本地判断，命中后自动切换到 R18 专用 RunningHub API Key 和工作流。
+- 最终英文 prompt 固定写入插件控制版工作流的 `11.text`，不会再回退到工作流内部 LLM。
 - 调用 RunningHub `/openapi/v2/run/workflow/{workflowId}` 提交已发布工作流。
 - 下载鸭子图后本地解码，可按配置发送解码后的原图或未解码的鸭子图。
 - 当发送鸭子图时，会附带 `https://duck.airush.top/` 提示用户可在线解码查看原图。
@@ -27,18 +27,18 @@ AstrBot 鸭子图绘图插件。用户发送 `/画图 提示词` 后，插件会
 常用可选项：
 
 - `output_image_mode`：输出图片模式。`decoded` 发送解码后的原图；`duck` 发送未解码的鸭子图并附带在线解码地址。
-- `r18_review_enabled`：是否开启 R18 审查与自动路由。开启后会检查增强/翻译后的提示词，不联网、不调用 LLM 审查。
+- `r18_review_enabled`：是否开启 R18 审查与自动路由。开启后会检查增强结果或英文直投提示词，不联网、不调用 LLM 审查。
 - `r18_api_key`：R18 专用 RunningHub API Key。仅在开启审查且命中 R18 时使用。
 - `r18_workflow_id`：R18 专用工作流 ID，默认 `2060002715337584642`。该工作流需与普通工作流使用相同节点 ID。
+- `enhance_prompt`：开启时增强并翻译用户提示词；关闭后仅接受英文提示词，非英文输入不会提交 RunningHub。
 - `prompt_output_style`：提示词增强输出风格。`danbooru_tags` 为严格 tag；`skill_mixed` 遵循 `SKILL.md` 的 tag + 短句；`natural_english` 为少量基础 tag + 2-3 句英文自然语言画面描述，不是纯 tag 模式。
 - `prompt_danbooru_tag_format`：兼容旧配置。未配置 `prompt_output_style` 时才会用于映射输出风格。
-- `prompt_delivery_mode`：提示词送入方式。`workflow_input` 适合把 prompt 写入工作流内部输入节点；`final_clip` 适合插件端生成最终 prompt 后直接写入最终 CLIPTextEncode.text。
 - `instance_type`：RunningHub 实例类型，`default` 为 24G 显存，`plus` 为 48G 显存。
 - `use_personal_queue`：是否使用个人独占队列。
 - `retain_seconds`：实例保留时长，通常仅企业共享 API Key 生效。
 - `prompt_provider_id`：提示词增强/翻译使用的模型 Provider，留空时自动选择当前会话模型。
-- `prompt_timeout_seconds`：提示词增强最长等待时间，默认 120 秒、最小 10 秒；超时后会使用原提示词继续提交 RunningHub，并在任务回执中说明已降级。
-- `prompt_template`：最终正向提示词模板，`{prompt}` 会替换为增强后的最终 prompt。
+- `prompt_timeout_seconds`：提示词增强最长等待时间，默认 120 秒、最小 10 秒。超时后仅英文原提示词会降级提交；非英文输入会中止，不创建 RunningHub 任务。
+- `prompt_template`：最终正向提示词模板，`{prompt}` 会替换为增强结果或英文直投提示词。
 - `artist_mode`：画师选择模式。`none` 不添加画师；`fixed` 使用 `artist_id`；`random` 从 `artist_random_list` 随机抽取。
 - `artist_id`：指定画师 ID。可以填 `unohana pochiko`，插件会规范化为 `@unohana_pochiko`。
 - `artist_random_list`：随机画师候选列表，支持换行、逗号、分号分隔，也支持 `@tare@umi` 这种连续写法。
@@ -60,23 +60,23 @@ AstrBot 鸭子图绘图插件。用户发送 `/画图 提示词` 后，插件会
 
 ## 工作流节点
 
-仓库内保留了你提供的 Anima base v1 鸭子图版 API JSON 副本 `workflow.json` 作为节点参考。插件提交的是你已发布的 RunningHub 工作流，并默认只覆盖必要输入。采样步数、CFG、seed、宽高等绘图参数全部使用工作流自身默认值：
+插件只支持“超强动漫模型 ANIMA 正式版-全自动版本_仅鸭子图输出版”的插件控制版拓扑。仓库内的 `workflow.json` 是旧版历史参考，不会在运行时读取，也不再作为当前线上节点的权威定义。插件只覆盖必要输入，采样步数、CFG、seed、宽高等参数使用已发布工作流自身的默认值：
 
 - 正向提示词：节点 `11` 的 `text`
 - 负向提示词：节点 `12` 的 `text`
-- DuckHideNode 密码：节点 `99` 的 `password`
+- DuckHideNode 密码：节点 `100` 的 `password`
+- 最终 SaveImage 输出：节点 `86`
 
-如果你的 RunningHub 工作流节点 ID 不同，请在插件配置中调整对应 ID。
+节点 `11.text` 必须保持未连线，由插件直接写入最终英文 prompt；当前插件不支持节点 `93` 或其他工作流内部 LLM 输入方式。普通与 R18 工作流都必须遵循相同节点契约。
 
-### 新 ANIMA 工作流插件控制版
+### 提示词降级规则
 
-如果使用“超强动漫模型 ANIMA 正式版-全自动版本_仅鸭子图输出版”并希望由 AstrBot/Grok 负责增强、翻译和合并预设提示词，建议发布一份插件控制版工作流：
+- 增强成功：格式化模型返回的英文 prompt，再写入节点 `11.text`。
+- 增强关闭：只有英文原提示词可以直投；中文或中英混合输入会直接拒绝。
+- 增强超时、无可用 Provider 或连续失败：英文原提示词可以降级提交；非英文输入会中止，并明确说明没有创建 RunningHub 任务。
+- LLM 返回非英文文本：视为无效结果并重试，不能把非英文内容直接送入最终文本编码节点。
 
-- 断开 `92 -> 11.text`，避免工作流内部 `RH_LLMAPI_Pro_Node` 覆盖插件生成的最终 prompt。
-- 把节点 `91`、`96` 的固定质量词/画风词迁移到 `prompt_template`，例如 `masterpiece, best quality, score_9, score_8, highres, absurdres, anime screenshot, official art, {prompt}`；画师交给 `artist_mode` 管理。
-- 插件配置建议：`prompt_delivery_mode=final_clip`，`prompt_node_id=11`，`prompt_field_name=text`，`negative_node_id=12`，`duck_password_node_id=100`。
-
-如果不修改工作流，也可以使用 `prompt_delivery_mode=workflow_input` 并将 `prompt_node_id` 设为 `93`，但这样 prompt 还会经过工作流内部 LLM 二次处理。
+升级自旧版本时，`prompt_delivery_mode`、`prompt_node_id`、`prompt_field_name`、`negative_node_id`、`duck_password_node_id` 等旧配置会被忽略，并在插件启动时记录一次迁移警告。
 
 ## 依赖
 

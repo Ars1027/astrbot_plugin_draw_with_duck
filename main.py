@@ -24,14 +24,26 @@ DEFAULT_POSITIVE_TEMPLATE = (
 DUCK_DECODER_URL = "https://duck.airush.top/"
 DEFAULT_R18_WORKFLOW_ID = "2060002715337584642"
 VALID_OUTPUT_IMAGE_MODES = {"decoded", "duck"}
-VALID_PROMPT_DELIVERY_MODES = {"workflow_input", "final_clip"}
 VALID_PROMPT_OUTPUT_STYLES = {"danbooru_tags", "skill_mixed", "natural_english"}
 VALID_ARTIST_MODES = {"none", "fixed", "random"}
+POSITIVE_PROMPT_NODE_ID = "11"
+NEGATIVE_PROMPT_NODE_ID = "12"
+DUCK_PASSWORD_NODE_ID = "100"
+PROMPT_FIELD_NAME = "text"
+LEGACY_WORKFLOW_CONFIG_KEYS = (
+    "prompt_delivery_mode",
+    "prompt_node_id",
+    "prompt_field_name",
+    "negative_node_id",
+    "duck_password_node_id",
+)
 PROMPT_ENHANCEMENT_DISABLED = "disabled"
 PROMPT_ENHANCEMENT_SUCCESS = "enhanced"
 PROMPT_ENHANCEMENT_NO_PROVIDER = "no_provider_fallback"
 PROMPT_ENHANCEMENT_TIMEOUT = "timeout_fallback"
 PROMPT_ENHANCEMENT_FAILED = "error_fallback"
+PROMPT_ENHANCEMENT_INVALID = "invalid_output_fallback"
+PROMPT_FINAL_INVALID = "invalid_final_prompt"
 R18_ROUTE_NORMAL = "normal"
 R18_ROUTE_R18 = "r18"
 R18_PROMPT_TERMS = (
@@ -139,7 +151,7 @@ def _as_bool(value: Any, default: bool = False) -> bool:
     "astrbot_plugin_draw_with_duck",
     "Luochang",
     "按 SKILL.md 规则增强并翻译提示词，调用 RunningHub 生成鸭子图并用 SS_tools 解码后返回图片",
-    "v1.2.1",
+    "v1.2.2",
 )
 class DrawWithDuckPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -162,12 +174,16 @@ class DrawWithDuckPlugin(Star):
         self.use_personal_queue = _as_bool(config.get("use_personal_queue", False), False)
         self.retain_seconds = int(config.get("retain_seconds", 0) or 0)
 
-        self.prompt_node_id = str(config.get("prompt_node_id", "11") or "11").strip()
-        self.prompt_field_name = str(config.get("prompt_field_name", "text") or "text").strip()
-        self.negative_node_id = str(config.get("negative_node_id", "12") or "12").strip()
         self.negative_prompt = str(config.get("negative_prompt", "") or "").strip()
-        self.duck_password_node_id = str(config.get("duck_password_node_id", "99") or "99").strip()
         self.duck_password = str(config.get("duck_password", "") or "")
+        ignored_workflow_keys = [
+            key for key in LEGACY_WORKFLOW_CONFIG_KEYS if config.get(key, None) is not None
+        ]
+        if ignored_workflow_keys:
+            logger.warning(
+                "legacy workflow routing settings are ignored; using fixed nodes "
+                f"11.text/12.text/100.password: {', '.join(ignored_workflow_keys)}"
+            )
 
         self.enhance_prompt = _as_bool(config.get("enhance_prompt", True), True)
         legacy_danbooru_format = _as_bool(config.get("prompt_danbooru_tag_format", True), True)
@@ -195,19 +211,6 @@ class DrawWithDuckPlugin(Star):
         self.artist_random_list = str(
             config.get("artist_random_list", DEFAULT_ARTIST_RANDOM_LIST) or DEFAULT_ARTIST_RANDOM_LIST
         )
-        self.prompt_delivery_mode = str(
-            config.get("prompt_delivery_mode", "workflow_input") or "workflow_input"
-        ).strip().lower()
-        if self.prompt_delivery_mode not in VALID_PROMPT_DELIVERY_MODES:
-            logger.warning(
-                f"invalid prompt_delivery_mode={self.prompt_delivery_mode}, fallback to workflow_input"
-            )
-            self.prompt_delivery_mode = "workflow_input"
-        if self.prompt_delivery_mode == "final_clip" and self.prompt_node_id == "93":
-            logger.warning(
-                "prompt_delivery_mode=final_clip usually needs prompt_node_id to point to the final "
-                "CLIPTextEncode text field, not the workflow LLM input node"
-            )
         self.show_enhanced_prompt = _as_bool(config.get("show_enhanced_prompt", False), False)
         self.output_image_mode = str(config.get("output_image_mode", "decoded") or "decoded").strip().lower()
         if self.output_image_mode not in VALID_OUTPUT_IMAGE_MODES:
@@ -242,7 +245,9 @@ class DrawWithDuckPlugin(Star):
     @filter.command("画图", alias={"drawduck", "duckdraw"}, priority=1)
     async def draw(self, event: AstrMessageEvent):
         try:
-            raw_prompt = self._extract_command_arg(event.message_str)
+            raw_prompt = self._clean_raw_prompt(
+                self._extract_command_arg(event.message_str)
+            )
             if not raw_prompt:
                 yield event.plain_result(
                     "用法：/画图 提示词\n"
@@ -255,14 +260,54 @@ class DrawWithDuckPlugin(Star):
                 yield event.plain_result(config_error)
                 return
 
-            yield event.plain_result("收到，正在润色提示词并提交 RunningHub 任务。")
+            if not self.enhance_prompt and not self._is_english_compatible_prompt(
+                raw_prompt
+            ):
+                logger.warning(
+                    "prompt submission aborted status=disabled non_english_letters=true"
+                )
+                yield event.plain_result(
+                    self._prompt_submission_abort_message(PROMPT_ENHANCEMENT_DISABLED)
+                )
+                return
+
+            if self.enhance_prompt:
+                progress_message = "收到，正在润色提示词并提交 RunningHub 任务。"
+            else:
+                progress_message = (
+                    "收到，提示词增强已关闭，正在直接提交英文提示词到 RunningHub。"
+                )
+            yield event.plain_result(progress_message)
 
             try:
                 enhanced_prompt, enhancement_status = await self._enhance_prompt(
                     event, raw_prompt
                 )
+                if not self._is_english_compatible_prompt(enhanced_prompt):
+                    abort_status = (
+                        PROMPT_ENHANCEMENT_INVALID
+                        if enhancement_status == PROMPT_ENHANCEMENT_SUCCESS
+                        else enhancement_status
+                    )
+                    logger.warning(
+                        "prompt submission aborted "
+                        f"status={abort_status} non_english_letters=true"
+                    )
+                    yield event.plain_result(
+                        self._prompt_submission_abort_message(abort_status)
+                    )
+                    return
                 route = self._select_runninghub_route(enhanced_prompt)
                 final_prompt = self._build_final_prompt(enhanced_prompt)
+                if not self._is_english_compatible_prompt(final_prompt):
+                    logger.warning(
+                        "prompt submission aborted "
+                        "status=invalid_final_prompt non_english_letters=true"
+                    )
+                    yield event.plain_result(
+                        self._prompt_submission_abort_message(PROMPT_FINAL_INVALID)
+                    )
+                    return
                 logger.info(
                     f"submitting draw task route={route['mode']} workflow_id={route['workflow_id']}"
                 )
@@ -291,7 +336,6 @@ class DrawWithDuckPlugin(Star):
                 "final_prompt": final_prompt,
                 "prompt_output_style": self.prompt_output_style,
                 "artist_mode": self.artist_mode,
-                "prompt_delivery_mode": self.prompt_delivery_mode,
                 "route_mode": route["mode"],
                 "workflow_id": route["workflow_id"],
                 "created_at": time.time(),
@@ -335,7 +379,8 @@ class DrawWithDuckPlugin(Star):
                 "鸭子图绘图插件\n"
                 "用法：/画图 提示词\n"
                 "示例：/画图 蓝发机器人少女，夜晚水面，赛博朋克\n"
-                "流程：当前会话模型增强并翻译提示词 -> RunningHub 生成鸭子图 -> SS_tools 解码 -> 返回解码后的图片。"
+                "流程：当前会话模型增强并翻译提示词 -> RunningHub 生成鸭子图 -> SS_tools 解码 -> 返回解码后的图片。\n"
+                "关闭提示词增强后，只接受英文提示词；非英文输入不会提交 RunningHub。"
             )
         finally:
             event.stop_event()
@@ -354,14 +399,28 @@ class DrawWithDuckPlugin(Star):
             return "请先在插件配置中填写 runninghub_api_key。"
         if not self.workflow_id:
             return "请先在插件配置中填写 workflow_id，即 RunningHub 工作流 ID。"
+        template_sentinel = "astrbot_prompt_sentinel"
+        try:
+            rendered_template = self.prompt_template.format(
+                prompt=template_sentinel
+            )
+        except Exception:
+            return "prompt_template 格式无效，请保留可用的 {prompt} 占位符。"
+        if template_sentinel not in rendered_template:
+            return "prompt_template 必须包含 {prompt} 占位符。"
+        if not self._is_english_compatible_prompt(rendered_template):
+            return "prompt_template 只能包含英文提示词、数字和标点。"
         return ""
 
     async def _enhance_prompt(
         self, event: AstrMessageEvent, prompt: str
     ) -> tuple[str, str]:
-        fallback_prompt = self._format_enhanced_prompt(prompt) or prompt
+        fallback_prompt = self._clean_raw_prompt(prompt)
         if not self.enhance_prompt:
-            logger.info("prompt enhancement disabled, using raw prompt")
+            logger.info(
+                "prompt enhancement disabled, using raw prompt "
+                f"english_compatible={self._is_english_compatible_prompt(fallback_prompt)}"
+            )
             return fallback_prompt, PROMPT_ENHANCEMENT_DISABLED
 
         provider_id = await self._get_prompt_provider_id(event.unified_msg_origin)
@@ -378,6 +437,7 @@ class DrawWithDuckPlugin(Star):
             f"timeout_seconds={self.prompt_timeout_seconds}"
         )
 
+        saw_invalid_output = False
         for attempt in range(2):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -396,9 +456,27 @@ class DrawWithDuckPlugin(Star):
                     ),
                     timeout=remaining,
                 )
-                text = self._format_enhanced_prompt(
+                completion_text = str(
                     getattr(resp, "completion_text", "") or ""
-                )
+                ).strip()
+                if completion_text and not self._is_english_compatible_prompt(
+                    completion_text
+                ):
+                    saw_invalid_output = True
+                    logger.warning(
+                        "prompt enhancement returned non-English text "
+                        f"({attempt + 1}/2)"
+                    )
+                    text = ""
+                else:
+                    text = self._format_enhanced_prompt(completion_text)
+                    if not self._is_english_compatible_prompt(text):
+                        saw_invalid_output = True
+                        logger.warning(
+                            "prompt enhancement became unusable after formatting "
+                            f"({attempt + 1}/2)"
+                        )
+                        text = ""
                 if text:
                     elapsed = time.monotonic() - started_at
                     logger.info(
@@ -406,9 +484,10 @@ class DrawWithDuckPlugin(Star):
                         f"elapsed_seconds={elapsed:.2f}"
                     )
                     return text, PROMPT_ENHANCEMENT_SUCCESS
-                logger.warning(
-                    f"prompt enhancement returned empty text ({attempt + 1}/2)"
-                )
+                if not completion_text:
+                    logger.warning(
+                        f"prompt enhancement returned empty text ({attempt + 1}/2)"
+                    )
             except asyncio.TimeoutError:
                 elapsed = time.monotonic() - started_at
                 logger.warning(
@@ -427,20 +506,64 @@ class DrawWithDuckPlugin(Star):
                     await asyncio.sleep(min(1, remaining))
 
         elapsed = time.monotonic() - started_at
+        fallback_status = (
+            PROMPT_ENHANCEMENT_INVALID
+            if saw_invalid_output
+            else PROMPT_ENHANCEMENT_FAILED
+        )
         logger.warning(
             f"prompt enhancement exhausted retries after {elapsed:.2f}s "
-            f"provider_id={provider_id}, fallback to raw prompt"
+            f"provider_id={provider_id} status={fallback_status}, fallback to raw prompt"
         )
-        return fallback_prompt, PROMPT_ENHANCEMENT_FAILED
+        return fallback_prompt, fallback_status
 
     def _prompt_enhancement_notice(self, status: str) -> str:
+        if status == PROMPT_ENHANCEMENT_DISABLED:
+            return "\n提示词增强已关闭，已直接使用英文原提示词。"
         if status == PROMPT_ENHANCEMENT_TIMEOUT:
-            return "\n提示词润色超时，已使用原提示词继续提交。"
+            return "\n提示词润色超时，已使用英文原提示词继续提交。"
         if status == PROMPT_ENHANCEMENT_NO_PROVIDER:
-            return "\n未找到可用的提示词模型，已使用原提示词继续提交。"
+            return "\n未找到可用的提示词模型，已使用英文原提示词继续提交。"
         if status == PROMPT_ENHANCEMENT_FAILED:
-            return "\n提示词润色失败，已使用原提示词继续提交。"
+            return "\n提示词润色失败，已使用英文原提示词继续提交。"
+        if status == PROMPT_ENHANCEMENT_INVALID:
+            return "\n提示词模型未返回有效英文结果，已使用英文原提示词继续提交。"
         return ""
+
+    def _prompt_submission_abort_message(self, status: str) -> str:
+        if status == PROMPT_ENHANCEMENT_DISABLED:
+            reason = "提示词增强已关闭，但输入包含非英文文字。"
+        elif status == PROMPT_ENHANCEMENT_TIMEOUT:
+            reason = "提示词润色超时，且原提示词包含非英文文字，无法安全降级。"
+        elif status == PROMPT_ENHANCEMENT_NO_PROVIDER:
+            reason = "未找到可用的提示词模型，且原提示词包含非英文文字。"
+        elif status == PROMPT_ENHANCEMENT_INVALID:
+            reason = "提示词模型未返回有效英文结果，且原提示词无法直接提交。"
+        elif status == PROMPT_FINAL_INVALID:
+            reason = "最终正向提示词包含非英文文字，请检查 prompt_template 配置。"
+        else:
+            reason = "提示词润色失败，且原提示词包含非英文文字，无法安全降级。"
+        return (
+            f"{reason}\n"
+            "当前工作流只支持向最终文本编码节点提交英文提示词。请开启提示词增强后重试，"
+            "或改用英文提示词。\n"
+            "未提交 RunningHub 任务，不会消耗本次绘图点数。"
+        )
+
+    def _clean_raw_prompt(self, text: str) -> str:
+        text = str(text or "").strip()
+        return re.sub(r"[ \t]*[\r\n]+[ \t]*", " ", text).strip()
+
+    def _is_english_compatible_prompt(self, text: str) -> bool:
+        text = str(text or "").strip()
+        if not text:
+            return False
+        has_ascii_letter = any(char.isascii() and char.isalpha() for char in text)
+        return has_ascii_letter and all(
+            not char.isalpha()
+            or (char.isascii() and "a" <= char.lower() <= "z")
+            for char in text
+        )
 
     def _build_prompt_system_prompt(self) -> str:
         skill_text = self._load_prompt_skill()
@@ -672,9 +795,9 @@ class DrawWithDuckPlugin(Star):
         if not self._is_r18_prompt(enhanced_prompt):
             return self._normal_runninghub_route()
         if not self.r18_api_key:
-            raise RuntimeError("增强后的提示词被判定为 R18，但未配置 r18_api_key。")
+            raise RuntimeError("提示词被判定为 R18，但未配置 r18_api_key。")
         if not self.r18_workflow_id:
-            raise RuntimeError("增强后的提示词被判定为 R18，但未配置 r18_workflow_id。")
+            raise RuntimeError("提示词被判定为 R18，但未配置 r18_workflow_id。")
         return {
             "mode": R18_ROUTE_R18,
             "api_key": self.r18_api_key,
@@ -738,24 +861,25 @@ class DrawWithDuckPlugin(Star):
         return data
 
     def _build_node_info_list(self, prompt: str) -> list[dict[str, Any]]:
-        # workflow_input mode targets the workflow's text input node.
-        # final_clip mode targets the final CLIPTextEncode text field; the published
-        # workflow must leave that text widget unlinked so this value is not overwritten.
         items: list[dict[str, Any]] = [
-            {"nodeId": self.prompt_node_id, "fieldName": self.prompt_field_name, "fieldValue": prompt},
+            {
+                "nodeId": POSITIVE_PROMPT_NODE_ID,
+                "fieldName": PROMPT_FIELD_NAME,
+                "fieldValue": prompt,
+            },
         ]
         if self.negative_prompt:
             items.append(
                 {
-                    "nodeId": self.negative_node_id,
-                    "fieldName": "text",
+                    "nodeId": NEGATIVE_PROMPT_NODE_ID,
+                    "fieldName": PROMPT_FIELD_NAME,
                     "fieldValue": self.negative_prompt,
                 }
             )
         if self.duck_password:
             items.append(
                 {
-                    "nodeId": self.duck_password_node_id,
+                    "nodeId": DUCK_PASSWORD_NODE_ID,
                     "fieldName": "password",
                     "fieldValue": self.duck_password,
                 }
