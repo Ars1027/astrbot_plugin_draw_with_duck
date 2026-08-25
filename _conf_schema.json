@@ -15,20 +15,20 @@
     "description": "是否开启 R18 提示词审查与自动路由",
     "type": "bool",
     "default": false,
-    "hint": "开启后会检查增强后的提示词；命中 R18 时使用 R18 专用 API Key 和工作流"
+    "hint": "开启后会检查增强结果或英文直投提示词；命中 R18 时使用 R18 专用 API Key 和工作流"
   },
   "r18_api_key": {
     "description": "R18 专用 RunningHub API Key",
     "type": "string",
     "default": "",
-    "hint": "仅在开启 R18 审查且增强后的提示词命中 R18 时使用",
+    "hint": "仅在开启 R18 审查且增强结果或英文直投提示词命中 R18 时使用",
     "obvious_hint": true
   },
   "r18_workflow_id": {
     "description": "R18 专用 RunningHub 工作流 ID",
     "type": "string",
     "default": "2060002715337584642",
-    "hint": "R18 工作流节点 ID 需与普通工作流一致"
+    "hint": "R18 工作流需使用与普通工作流相同的固定节点：正向 11、负向 12、DuckHide 100"
   },
   "api_base": {
     "description": "RunningHub API 基础地址",
@@ -66,7 +66,8 @@
   "enhance_prompt": {
     "description": "按 SKILL.md / ANIMA3 规则增强并翻译提示词",
     "type": "bool",
-    "default": true
+    "default": true,
+    "hint": "关闭后只接受英文提示词；非英文输入不会提交 RunningHub"
   },
   "prompt_danbooru_tag_format": {
     "description": "兼容旧配置：最终提示词是否强制符合 Danbooru tag 格式",
@@ -92,7 +93,7 @@
     "description": "提示词增强最长等待时间（秒）",
     "type": "int",
     "default": 120,
-    "hint": "最小 10 秒；超时后使用原提示词继续提交 RunningHub"
+    "hint": "最小 10 秒；超时后仅英文原提示词会继续提交，非英文输入会中止且不创建 RunningHub 任务"
   },
   "show_enhanced_prompt": {
     "description": "提交后显示实际发送给 RunningHub 的最终正向提示词",
@@ -100,7 +101,7 @@
     "default": false
   },
   "prompt_template": {
-    "description": "最终正向提示词模板，使用 {prompt} 插入增强后的最终 prompt",
+    "description": "最终正向提示词模板，使用 {prompt} 插入增强结果或英文直投提示词",
     "type": "text",
     "default": "masterpiece, best_quality, amazing_quality, detailed, newest, anime_coloring, anime_screenshot, {prompt}"
   },
@@ -123,13 +124,6 @@
     "type": "text",
     "default": "@tare\n@umi\n@hjl\n@unohana_pochiko\n@ningen_mame\n@sugimura_tomokazu\n@jyt\n@navy\n@seungju_lee\n@herio\n@c.honey\n@nahanmin\n@misheng_liu_yin\n@haruki_(colorful_macaron)\n@daeho_cha\n@yusan\n@yue\n@mokokoiro\n@renge\n@minowa_sukyaru\n@chigusa_minori",
     "hint": "仅 artist_mode=random 时使用；支持换行、逗号、分号分隔，也支持 @tare@umi 这种连续写法"
-  },
-  "prompt_delivery_mode": {
-    "description": "提示词送入工作流的方式",
-    "type": "string",
-    "default": "workflow_input",
-    "options": ["workflow_input", "final_clip"],
-    "hint": "workflow_input=写入工作流内部的提示词输入节点，例如新 ANIMA 工作流的 93；final_clip=插件端生成最终正向 prompt，直接写入最终 CLIPTextEncode.text，新 ANIMA 插件控制版建议 11"
   },
   "negative_prompt": {
     "description": "覆盖负向提示词（留空则使用 workflow 默认值）",
@@ -173,21 +167,5 @@
     "description": "本地保留最近多少组图片文件",
     "type": "int",
     "default": 30
-  },
-  "prompt_node_id": {
-    "description": "正向提示词节点 ID",
-    "type": "string",
-    "default": "11",
-    "hint": "prompt_delivery_mode=workflow_input 时可指向工作流内部输入节点；prompt_delivery_mode=final_clip 时应指向最终 CLIPTextEncode.text"
-  },
-  "negative_node_id": {
-    "description": "负向提示词节点 ID",
-    "type": "string",
-    "default": "12"
-  },
-  "duck_password_node_id": {
-    "description": "DuckHideNode 节点 ID",
-    "type": "string",
-    "default": "99"
   }
 }
